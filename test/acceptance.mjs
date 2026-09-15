@@ -196,7 +196,89 @@ try {
   ok(handovers.generatedAt != null, '交接班数据跨重启可用');
   const auditAll = (await api('GET', '/api/audit?limit=500')).json.audit;
   ok(auditAll.length > 20, `审计日志完整（${auditAll.length} 条）`);
+
+  // ---------- 11. 反例：暂停保持 ----------
+  section('11. 反例：暂停中的器械不随批次完成/监测/放行而改变');
+  await api('POST', '/api/instruments', { code: 'TST-101', name: '暂停保持甲' }, { actor: '王芳' });
+  const instP = (await api('GET', '/api/instruments?q=TST-101')).json.instruments[0].id;
+  r = await api('POST', '/api/batches', { washerId: 'EQ-W01', sterilizerId: 'EQ-S01', operatorId: 'OP-01', instrumentIds: [instP] }, { actor: '王芳' });
+  const bP = r.json.batch.id;
+  r = await api('POST', `/api/instruments/${instP}/pause-related`, { reason: '暂停保持测试' }, { actor: '王芳' });
+  const pauseP = r.json.pause;
+  ok(r.status === 200 && pauseP.items.length === 1, '暂停成功（单件批次仅含自身）');
+  await api('POST', `/api/batches/${bP}/complete`, {}, { actor: '王芳' });
+  ok((await getInst(instP)).status === '已暂停', '批次完成灭菌周期 → 器械仍暂停');
+  await api('POST', `/api/batches/${bP}/monitor`, { chemMonitor: '合格', bioMonitor: '合格' }, { actor: '李强' });
+  ok((await getInst(instP)).status === '已暂停', '登记监测合格 → 器械仍暂停');
+  r = await api('POST', `/api/batches/${bP}/release`, {}, { actor: '王芳', idemKey: 'rel-p' });
+  ok(r.status === 200 && (await getInst(instP)).status === '已暂停', '批次放行 → 器械仍暂停');
+  ok((await getBatch(bP)).releaseStatus === '已放行', '批次本身正常放行');
+  r = await api('POST', `/api/pauses/${pauseP.id}/lift`, { scopeInstrumentIds: [instP] }, { actor: '王芳' });
+  ok(r.status === 200 && (await getInst(instP)).status === '无菌在库', '按范围解除暂停 → 依批次已放行解析为无菌在库');
+  ok((await getInst(instP)).sterileUntil != null, '恢复后继承批次无菌效期');
+
+  // ---------- 12. 反例：已恢复批次再次锁定 → 全部重新隔离 ----------
+  section('12. 反例：已恢复批次再次锁定，全部受影响器械重新隔离');
+  r = await api('POST', '/api/batches/B-SEED-4/lock', { reason: '同供应商另一批次检出污染，扩大召回' }, { actor: '李强' });
+  ok(r.status === 200, '已恢复批次允许再次锁定');
+  ok((await getInst('INS-009')).status === '已隔离' && (await getInst('INS-010')).status === '已隔离', '曾恢复的器械重新隔离');
+  const b4r = await getBatch('B-SEED-4');
+  ok(b4r.releaseStatus === '已锁定' && b4r.quarantine.filter((q) => !q.restoredAt).length === 2, '隔离清单重新打开 2 条');
+
+  // ---------- 13. 反例：设备更新校验失败回滚 ----------
+  section('13. 反例：设备更新校验失败，内存与磁盘均保持原值');
+  const eqBefore = (await api('GET', '/api/equipment')).json.equipment.find((e) => e.id === 'EQ-W01');
+  r = await api('PATCH', '/api/equipment/EQ-W01', { calibrationDue: new Date(nowMs - 864e5).toISOString(), status: '正常', expectedVersion: eqBefore.version }, { actor: '李强' });
+  ok(r.status === 409 && r.json.error.code === 'CALIBRATION_EXPIRED', '以过期校准启用设备被拒');
+  const eqAfter = (await api('GET', '/api/equipment')).json.equipment.find((e) => e.id === 'EQ-W01');
+  ok(eqAfter.calibrationDue === eqBefore.calibrationDue && eqAfter.status === eqBefore.status && eqAfter.version === eqBefore.version, '校验失败后内存数据保持原值');
+  r = await api('PATCH', '/api/equipment/EQ-W01', { calibrationDue: 'not-a-date' }, { actor: '李强' });
+  ok(r.status === 400, '非法日期被拒');
+  ok((await api('GET', '/api/equipment')).json.equipment.find((e) => e.id === 'EQ-W01').version === eqBefore.version, '再次失败后版本号未变');
+
+  // ---------- 14. 反例：生物监测超时锁死 ----------
+  section('14. 反例：超过判读时限，补录合格与放行均被拒');
+  await api('POST', '/api/instruments', { code: 'TST-102', name: '超时锁死乙' }, { actor: '王芳' });
+  const instQ = (await api('GET', '/api/instruments?q=TST-102')).json.instruments[0].id;
+  r = await api('POST', '/api/batches', { washerId: 'EQ-W01', sterilizerId: 'EQ-S01', operatorId: 'OP-01', instrumentIds: [instQ] }, { actor: '王芳' });
+  const bQ = r.json.batch.id;
+  await api('POST', `/api/batches/${bQ}/complete`, {}, { actor: '王芳' });
+  nowMs += 49 * 3600 * 1000; // 超过 48h 判读时限（先不触发清扫）
+  r = await api('POST', `/api/batches/${bQ}/monitor`, { bioMonitor: '合格' }, { actor: '李强' });
+  ok(r.status === 409 && r.json.error.code === 'BIO_MONITOR_OVERDUE', '超时补录合格被拒（领域守卫，不依赖定时清扫）');
+  r = await api('POST', `/api/batches/${bQ}/release`, {}, { actor: '王芳', idemKey: 'rel-q' });
+  ok(r.status === 400 && r.json.error.code === 'MONITOR_NOT_PASSED', '超时未判读批次放行被拒');
+  await api('GET', '/api/state'); // 触发清扫
+  ok((await getBatch(bQ)).releaseStatus === '已锁定', '清扫后超时批次自动锁定');
+  r = await api('POST', `/api/batches/${bQ}/monitor`, { bioMonitor: '合格' }, { actor: '李强' });
+  ok(r.status === 409 && r.json.error.code === 'BIO_MONITOR_OVERDUE', '锁定后补录合格仍被拒');
+
+  // ---------- 15. 刷新/重启一致 + 幂等重放跨重启 ----------
+  section('15. 刷新与重启后数据一致，幂等重放跨重启有效');
+  const countsBefore = (await api('GET', '/api/state')).json.counts;
   await app2.close();
+  const app3 = createApp({ dataFile: DATA, nowFn: () => new Date(nowMs), sweepIntervalMs: 3_600_000 });
+  await app3.listen(PORT);
+  const countsAfter = (await api('GET', '/api/state')).json.counts;
+  ok(JSON.stringify(countsAfter) === JSON.stringify(countsBefore), '重启后看板计数一致');
+  const eqW01 = (await api('GET', '/api/equipment')).json.equipment.find((e) => e.id === 'EQ-W01');
+  ok(eqW01.calibrationDue === eqBefore.calibrationDue, '失败更新未写入磁盘（持久化保持原值）');
+  await api('POST', '/api/instruments', { code: 'TST-103', name: '重放验证丙' }, { actor: '王芳' });
+  const instR = (await api('GET', '/api/instruments?q=TST-103')).json.instruments[0].id;
+  r = await api('POST', '/api/batches', { washerId: 'EQ-W01', sterilizerId: 'EQ-S01', operatorId: 'OP-01', instrumentIds: [instR] }, { actor: '王芳' });
+  const bR = r.json.batch.id;
+  await api('POST', `/api/batches/${bR}/complete`, {}, { actor: '王芳' });
+  await api('POST', `/api/batches/${bR}/monitor`, { chemMonitor: '合格', bioMonitor: '合格' }, { actor: '王芳' });
+  r = await api('POST', `/api/batches/${bR}/release`, {}, { actor: '王芳', idemKey: 'persist-key' });
+  ok(r.status === 200, '新批次放行成功');
+  await app3.close();
+  const app4 = createApp({ dataFile: DATA, nowFn: () => new Date(nowMs), sweepIntervalMs: 3_600_000 });
+  await app4.listen(PORT);
+  r = await api('POST', `/api/batches/${bR}/release`, {}, { actor: '李强', idemKey: 'persist-key' });
+  ok(r.status === 200 && r.replay, '重启后同一幂等键返回首次结果（不重复放行）');
+  const auditR = (await api('GET', `/api/audit?entityType=batch&entityId=${bR}`)).json.audit;
+  ok(auditR.filter((a) => a.action === '放行批次').length === 1, '审计仍仅一条放行记录');
+  await app4.close();
 } catch (e) {
   failed++;
   console.error('验收执行异常：', e);

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { api, fmtDateTime, fmtTime, remainText, Instrument, TraceData, Pause } from '../api';
+import { api, fmtDateTime, fmtTime, remainText, newIdemKey, Instrument, TraceData, Pause } from '../api';
 import { Pill, Modal, Field, Empty, Section, useToast, useApiError } from '../ui';
 
 const STATUS_FILTERS = ['', '待处理', '处理中', '待放行', '无菌在库', '使用中', '已隔离', '已暂停'];
@@ -182,23 +182,23 @@ function TraceDrawer({ trace, onClose, onChanged, onOpenInstrument }: {
 
         {pauseFor && (
           <PauseModal root={inst} related={related} onClose={() => setPauseFor(false)}
-            onPause={(reason) => act(async () => {
-              const r = await api<{ pause: Pause }>('POST', `/api/instruments/${inst.id}/pause-related`, { reason });
+            onPause={(reason, idemKey) => act(async () => {
+              const r = await api<{ pause: Pause }>('POST', `/api/instruments/${inst.id}/pause-related`, { reason }, { idemKey });
               setPauseFor(false);
               toast('warn', `已暂停 ${r.pause.items.length} 件关联器械`);
             }, '已暂停')} />
         )}
         {liftPause && (
           <LiftModal pause={liftPause} trace={trace} onClose={() => setLiftPause(null)}
-            onLift={(ids) => act(async () => {
-              await api('POST', `/api/pauses/${liftPause.id}/lift`, { scopeInstrumentIds: ids });
+            onLift={(ids, idemKey) => act(async () => {
+              await api('POST', `/api/pauses/${liftPause.id}/lift`, { scopeInstrumentIds: ids }, { idemKey });
               setLiftPause(null);
             }, '已按范围恢复')} />
         )}
         {checkout && (
           <CheckoutModal instrumentId={inst.id} onClose={() => setCheckout(false)}
-            onCheckout={(room) => act(async () => {
-              await api('POST', `/api/instruments/${inst.id}/checkout`, { room });
+            onCheckout={(room, idemKey) => act(async () => {
+              await api('POST', `/api/instruments/${inst.id}/checkout`, { room }, { idemKey });
               setCheckout(false);
             }, '已领取')} />
         )}
@@ -208,9 +208,10 @@ function TraceDrawer({ trace, onClose, onChanged, onOpenInstrument }: {
 }
 
 function PauseModal({ root, related, onClose, onPause }: {
-  root: Instrument; related: TraceData['related']; onClose: () => void; onPause: (reason: string) => void;
+  root: Instrument; related: TraceData['related']; onClose: () => void; onPause: (reason: string, idemKey: string) => void;
 }) {
   const [reason, setReason] = useState('');
+  const [idemKey] = useState(newIdemKey); // 弹窗期间固定：双击/重试返回同一结果
   return (
     <Modal title={`一键暂停关联器械（源头：${root.code}）`} onClose={onClose} width={560}>
       <div className="banner warn">将暂停源头器械及 {related.length} 件关联器械（同批次 / 同诊室时段重叠 / 同灭菌器后续批次），已隔离的除外</div>
@@ -226,17 +227,18 @@ function PauseModal({ root, related, onClose, onPause }: {
       <Field label="暂停原因"><textarea rows={2} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="必填，例如：疑似污染事件调查" /></Field>
       <div className="modal-foot">
         <button className="btn" onClick={onClose}>取消</button>
-        <button className="btn danger" disabled={!reason.trim()} onClick={() => onPause(reason.trim())}>确认暂停全部关联器械</button>
+        <button className="btn danger" disabled={!reason.trim()} onClick={() => onPause(reason.trim(), idemKey)}>确认暂停全部关联器械</button>
       </div>
     </Modal>
   );
 }
 
 function LiftModal({ pause, trace, onClose, onLift }: {
-  pause: Pause; trace: TraceData; onClose: () => void; onLift: (ids: string[]) => void;
+  pause: Pause; trace: TraceData; onClose: () => void; onLift: (ids: string[], idemKey: string) => void;
 }) {
   const open = pause.items.filter((i) => !i.restoredAt);
   const [scope, setScope] = useState<Set<string>>(new Set());
+  const [idemKey] = useState(newIdemKey); // 弹窗期间固定：双击/重试返回同一结果
   const nameOf = (id: string) => {
     if (id === trace.instrument.id) return `${trace.instrument.code} ${trace.instrument.name}`;
     const r = trace.related.find((x) => x.instrumentId === id);
@@ -257,17 +259,18 @@ function LiftModal({ pause, trace, onClose, onLift }: {
       </Field>
       <div className="modal-foot">
         <button className="btn" onClick={onClose}>取消</button>
-        <button className="btn primary" disabled={scope.size === 0} onClick={() => onLift([...scope])}>恢复选中器械</button>
+        <button className="btn primary" disabled={scope.size === 0} onClick={() => onLift([...scope], idemKey)}>恢复选中器械</button>
       </div>
     </Modal>
   );
 }
 
 function CheckoutModal({ instrumentId, onClose, onCheckout }: {
-  instrumentId: string; onClose: () => void; onCheckout: (room: string) => void;
+  instrumentId: string; onClose: () => void; onCheckout: (room: string, idemKey: string) => void;
 }) {
   const ROOMS = ['诊室1', '诊室2', '测听室1', '测听室2', '验配室', '处置室'];
   const [room, setRoom] = useState(ROOMS[0]);
+  const [idemKey] = useState(newIdemKey); // 弹窗期间固定：双击/重试返回同一结果
   return (
     <Modal title="领取器械至诊室" onClose={onClose}>
       <Field label="领取诊室">
@@ -275,7 +278,7 @@ function CheckoutModal({ instrumentId, onClose, onCheckout }: {
       </Field>
       <div className="modal-foot">
         <button className="btn" onClick={onClose}>取消</button>
-        <button className="btn primary" onClick={() => onCheckout(room)}>确认领取</button>
+        <button className="btn primary" onClick={() => onCheckout(room, idemKey)}>确认领取</button>
       </div>
     </Modal>
   );

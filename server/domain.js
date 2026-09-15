@@ -62,9 +62,22 @@ export function audit(state, now, actor, action, entityType, entityId, detail) {
 export function updateEquipment(state, now, { equipmentId, actor, calibrationDue, status, expectedVersion }) {
   const eq = mustFind(state.equipment, equipmentId, '设备');
   expectVersion(eq, expectedVersion);
+  // 先完成全部校验，再修改任何字段：校验失败时内存与磁盘都必须保持原值
+  if (calibrationDue != null && Number.isNaN(new Date(calibrationDue).getTime())) {
+    throw new DomainError(400, 'BAD_DATE', '校准有效期格式不正确');
+  }
+  if (status != null && !['正常', '停用'].includes(status)) {
+    throw new DomainError(400, 'BAD_STATUS', '设备状态仅支持 正常/停用（校准过期由系统自动标记）');
+  }
+  const nextDue = calibrationDue ?? eq.calibrationDue;
+  if (status === '正常' && new Date(nextDue).getTime() <= now.getTime()) {
+    throw new DomainError(409, 'CALIBRATION_EXPIRED', '校准已过期，须先更新校准有效期才能启用');
+  }
+  if (calibrationDue == null && status == null) {
+    throw new DomainError(400, 'NO_CHANGE', '没有需要修改的内容');
+  }
   const changes = [];
   if (calibrationDue != null) {
-    if (Number.isNaN(new Date(calibrationDue).getTime())) throw new DomainError(400, 'BAD_DATE', '校准有效期格式不正确');
     changes.push(`校准有效期 ${eq.calibrationDue} → ${calibrationDue}`);
     eq.calibrationDue = calibrationDue;
     if (new Date(calibrationDue).getTime() > now.getTime() && eq.status === '校准过期') {
@@ -73,14 +86,9 @@ export function updateEquipment(state, now, { equipmentId, actor, calibrationDue
     }
   }
   if (status != null) {
-    if (!['正常', '停用'].includes(status)) throw new DomainError(400, 'BAD_STATUS', '设备状态仅支持 正常/停用（校准过期由系统自动标记）');
-    if (status === '正常' && new Date(eq.calibrationDue).getTime() <= now.getTime()) {
-      throw new DomainError(409, 'CALIBRATION_EXPIRED', '校准已过期，须先更新校准有效期才能启用');
-    }
     changes.push(`状态 ${eq.status} → ${status}`);
     eq.status = status;
   }
-  if (!changes.length) throw new DomainError(400, 'NO_CHANGE', '没有需要修改的内容');
   eq.version += 1;
   eq.updatedAt = iso(now);
   audit(state, now, actor, '更新设备', 'equipment', eq.id, `${eq.name}：${changes.join('；')}`);
@@ -117,7 +125,7 @@ export function createBatch(state, now, { actor, washerId, sterilizerId, operato
     createdAt: iso(now), createdBy: actor,
     completedAt: null, completedBy: null,
     chemMonitor: '未做', bioMonitor: '未做',
-    bioMonitorDueAt: null, monitorUpdatedAt: null, monitorBy: null,
+    bioMonitorDueAt: null, monitorUpdatedAt: null, monitorBy: null, bioMonitorAt: null,
     releaseStatus: '处理中',
     releasedAt: null, releasedBy: null, releaseIdemKey: null,
     lockReason: null, lockedAt: null, lockedBy: null,
@@ -151,14 +159,16 @@ export function completeBatch(state, now, { batchId, actor, expectedVersion }) {
   b.releaseStatus = '待放行';
   b.version += 1;
   b.updatedAt = iso(now);
+  let held = 0;
   for (const id of b.items) {
     const inst = mustFind(state.instruments, id);
+    if (inst.status === '已暂停') { held += 1; continue; } // 暂停保持：批次完成不解除暂停
     inst.status = '待放行';
     inst.version += 1;
     inst.updatedAt = iso(now);
   }
   audit(state, now, actor, '完成灭菌周期', 'batch', b.id,
-    `批次 ${b.batchNo} 灭菌周期完成，生物监测判读时限 ${b.bioMonitorDueAt}`);
+    `批次 ${b.batchNo} 灭菌周期完成，生物监测判读时限 ${b.bioMonitorDueAt}${held ? `；${held} 件器械因暂停保持原状` : ''}`);
   return { batch: b };
 }
 
@@ -172,8 +182,14 @@ export function recordMonitor(state, now, { batchId, actor, chemMonitor, bioMoni
   for (const [k, v] of [['化学监测', chemMonitor], ['生物监测', bioMonitor]]) {
     if (v != null && !['合格', '不合格'].includes(v)) throw new DomainError(400, 'BAD_VALUE', `${k}结果仅支持 合格/不合格`);
   }
+  // 超过判读时限后，补录生物监测「合格」无效（领域守卫，不依赖定时清扫）
+  if (bioMonitor === '合格' && b.bioMonitor === '未做' && b.bioMonitorDueAt
+      && new Date(b.bioMonitorDueAt).getTime() <= now.getTime()) {
+    throw new DomainError(409, 'BIO_MONITOR_OVERDUE',
+      `生物监测已超过判读时限（${b.bioMonitorDueAt}），补录合格无效；批次须锁定后走复检流程`);
+  }
   if (chemMonitor) b.chemMonitor = chemMonitor;
-  if (bioMonitor) b.bioMonitor = bioMonitor;
+  if (bioMonitor) { b.bioMonitor = bioMonitor; b.bioMonitorAt = iso(now); }
   b.monitorUpdatedAt = iso(now);
   b.monitorBy = actor;
   b.version += 1;
@@ -186,12 +202,7 @@ export function recordMonitor(state, now, { batchId, actor, chemMonitor, bioMoni
   return { batch: b };
 }
 
-export function releaseBatch(state, now, { batchId, actor, idemKey, expectedVersion }) {
-  // 幂等：同一 Idempotency-Key 重试/双击/刷新重发，直接返回首次结果，绝不重复放行
-  if (idemKey && state.idempotency[idemKey]) {
-    const hit = state.idempotency[idemKey];
-    return { ...hit.body, _replay: true };
-  }
+export function releaseBatch(state, now, { batchId, actor, expectedVersion }) {
   const b = mustFind(state.batches, batchId, '批次');
   if (b.releaseStatus !== '待放行') {
     const why = b.releaseStatus === '已放行'
@@ -207,6 +218,12 @@ export function releaseBatch(state, now, { batchId, actor, idemKey, expectedVers
     throw new DomainError(400, 'MONITOR_NOT_PASSED',
       `监测未全部合格（化学:${b.chemMonitor}，生物:${b.bioMonitor}），禁止放行`);
   }
+  // 生物监测结果须在判读时限内登记；超时补录的合格无效（recordMonitor 已拦截，此处兜底）
+  const bioAt = b.bioMonitorAt || b.monitorUpdatedAt;
+  if (b.bioMonitorDueAt && bioAt && new Date(bioAt).getTime() > new Date(b.bioMonitorDueAt).getTime()) {
+    throw new DomainError(409, 'BIO_MONITOR_OVERDUE',
+      `生物监测结果在判读时限（${b.bioMonitorDueAt}）之后登记，合格无效，禁止放行`);
+  }
   for (const eqId of [b.washerId, b.sterilizerId]) {
     const eq = mustFind(state.equipment, eqId, '设备');
     if (eq.status !== '正常' || new Date(eq.calibrationDue).getTime() <= now.getTime()) {
@@ -217,24 +234,21 @@ export function releaseBatch(state, now, { batchId, actor, idemKey, expectedVers
   b.releaseStatus = '已放行';
   b.releasedAt = iso(now);
   b.releasedBy = actor;
-  b.releaseIdemKey = idemKey || null;
   b.version += 1;
   b.updatedAt = iso(now);
+  let released = 0, held = 0;
   for (const id of b.items) {
     const inst = mustFind(state.instruments, id);
+    if (inst.status === '已暂停') { held += 1; continue; } // 暂停保持：放行不解除暂停
     inst.status = '无菌在库';
     inst.sterileUntil = sterileUntil;
     inst.version += 1;
     inst.updatedAt = iso(now);
+    released += 1;
   }
   audit(state, now, actor, '放行批次', 'batch', b.id,
-    `批次 ${b.batchNo} 放行，${b.items.length} 件器械转入无菌在库，无菌效期至 ${sterileUntil}`);
-  const body = { batch: b, sterileUntil };
-  if (idemKey) {
-    state.idempotency[idemKey] = { body, createdAt: iso(now) };
-    gcIdempotency(state, now);
-  }
-  return body;
+    `批次 ${b.batchNo} 放行，${released} 件器械转入无菌在库，无菌效期至 ${sterileUntil}${held ? `；${held} 件因暂停保持原状` : ''}`);
+  return { batch: b, sterileUntil };
 }
 
 function lockBatchInternal(state, now, b, actor, reason) {
@@ -246,23 +260,34 @@ function lockBatchInternal(state, now, b, actor, reason) {
   b.lockedBy = actor;
   b.version += 1;
   b.updatedAt = iso(now);
-  const quarantinedIds = new Set(b.quarantine.map((q) => q.instrumentId));
+  let isolated = 0, reisolated = 0;
   for (const id of b.items) {
     const inst = mustFind(state.instruments, id);
-    if (quarantinedIds.has(id) || inst.status === '已隔离') continue;
-    b.quarantine.push({ instrumentId: id, prevStatus: inst.status, restoredAt: null });
+    const existing = b.quarantine.find((q) => q.instrumentId === id);
+    if (existing && !existing.restoredAt) continue; // 仍在隔离中
+    if (existing) {
+      // 曾恢复 → 再次锁定时必须重新隔离（含已放行/已恢复批次召回）
+      existing.restoredAt = null;
+      existing.prevStatus = inst.status;
+      reisolated += 1;
+    } else {
+      b.quarantine.push({ instrumentId: id, prevStatus: inst.status, restoredAt: null });
+      isolated += 1;
+    }
     inst.status = '已隔离';
     inst.sterileUntil = null;
     inst.version += 1;
     inst.updatedAt = iso(now);
     for (const u of state.usage) {
-      if (u.instrumentId === id && u.status === '使用中') {
-        u.alert = `关联批次 ${b.batchNo} 已锁定：${reason}，请立即召回`;
+      if (u.instrumentId === id && u.endAt == null) {
+        u.status = '已召回';
+        u.endAt = iso(now);
+        u.alert = `关联批次 ${b.batchNo} 已锁定：${reason}，器械召回隔离`;
       }
     }
   }
   audit(state, now, actor, '锁定批次', 'batch', b.id,
-    `批次 ${b.batchNo} 由「${from}」锁定：${reason}；同批 ${b.items.length} 件器械已自动隔离`);
+    `批次 ${b.batchNo} 由「${from}」锁定：${reason}；同批器械隔离 ${isolated} 件${reisolated ? `、重新隔离 ${reisolated} 件` : ''}`);
 }
 
 export function lockBatch(state, now, { batchId, actor, reason, expectedVersion }) {
@@ -309,7 +334,10 @@ export function recheckBatch(state, now, { batchId, actor, result, scopeInstrume
       const q = open.find((x) => x.instrumentId === id);
       q.restoredAt = iso(now);
       const inst = mustFind(state.instruments, id);
-      if (sterileUntil && new Date(sterileUntil).getTime() > now.getTime()) {
+      if (activePauseFor(state, id)) {
+        inst.status = '已暂停'; // 暂停保持：复检恢复不得让器械离开暂停
+        inst.sterileUntil = null;
+      } else if (sterileUntil && new Date(sterileUntil).getTime() > now.getTime()) {
         inst.status = '无菌在库';
         inst.sterileUntil = sterileUntil;
       } else {
@@ -473,7 +501,7 @@ export function pauseRelated(state, now, { rootInstrumentId, reason, actor }) {
   for (const id of [rootInstrumentId, ...related.map((r) => r.instrumentId)]) {
     const inst = mustFind(state.instruments, id);
     if (!pausable.has(inst.status)) continue; // 已隔离/已暂停的不重复处理
-    items.push({ instrumentId: id, prevStatus: inst.status, restoredAt: null });
+    items.push({ instrumentId: id, prevStatus: inst.status, prevSterileUntil: inst.sterileUntil ?? null, restoredAt: null });
   }
   if (!items.length) throw new DomainError(409, 'NOTHING_TO_PAUSE', '没有可暂停的关联器械（均已隔离或暂停）');
   const pause = {
@@ -499,6 +527,37 @@ export function pauseRelated(state, now, { rootInstrumentId, reason, actor }) {
   return { pause };
 }
 
+function activePauseFor(state, instrumentId) {
+  return state.pauses.find((p) => p.status !== 'lifted'
+    && p.items.some((i) => i.instrumentId === instrumentId && !i.restoredAt));
+}
+
+// 暂停解除时的状态解析：暂停期间批次可能已完成/放行/锁定，按批次现状恢复，
+// 绝不简单回退到暂停前状态（否则会把「处理中」的器械绕过放行直接变成无菌）。
+function resolveRestoreStatus(state, now, inst, item) {
+  if (item.prevStatus === '待放行' || item.prevStatus === '处理中') {
+    const latest = state.batches
+      .filter((b) => b.items.includes(inst.id))
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+    if (latest) {
+      const entryRestored = (latest.quarantine || []).some((q) => q.instrumentId === inst.id && q.restoredAt);
+      if (latest.releaseStatus === '已放行' || latest.releaseStatus === '已恢复'
+          || (latest.releaseStatus === '部分恢复' && entryRestored)) {
+        const until = addDays(latest.completedAt, STERILE_DAYS);
+        return new Date(until).getTime() > now.getTime()
+          ? { status: '无菌在库', sterileUntil: until }
+          : { status: '待处理', sterileUntil: null };
+      }
+      if (latest.releaseStatus === '待放行') return { status: '待放行', sterileUntil: null };
+      if (latest.releaseStatus === '已锁定' || latest.releaseStatus === '部分恢复') {
+        return { status: '已隔离', sterileUntil: null };
+      }
+      return { status: '处理中', sterileUntil: null };
+    }
+  }
+  return { status: item.prevStatus, sterileUntil: item.prevSterileUntil ?? null };
+}
+
 export function liftPause(state, now, { pauseId, scopeInstrumentIds, actor }) {
   const p = mustFind(state.pauses, pauseId, '暂停记录');
   if (p.status === 'lifted') throw new DomainError(409, 'ALREADY_LIFTED', '该暂停已全部解除');
@@ -514,10 +573,13 @@ export function liftPause(state, now, { pauseId, scopeInstrumentIds, actor }) {
     const item = open.find((i) => i.instrumentId === id);
     item.restoredAt = iso(now);
     const inst = mustFind(state.instruments, id);
-    if (inst.status === '已暂停') {
-      inst.status = item.prevStatus;
-      inst.version += 1;
-      inst.updatedAt = iso(now);
+    if (inst.status !== '已暂停') continue; // 已被隔离等其他持有接管，不越权改变
+    const next = resolveRestoreStatus(state, now, inst, item);
+    inst.status = next.status;
+    inst.sterileUntil = next.sterileUntil;
+    inst.version += 1;
+    inst.updatedAt = iso(now);
+    if (next.status === '使用中') {
       for (const u of state.usage) {
         if (u.instrumentId === id && u.status === '已暂停') u.status = '使用中';
       }
@@ -693,4 +755,19 @@ function gcIdempotency(state, now) {
   for (const [k, v] of Object.entries(state.idempotency)) {
     if (new Date(v.createdAt).getTime() < cutoff) delete state.idempotency[k];
   }
+}
+
+// 幂等执行：同一 Idempotency-Key 的并发请求、双击、失败重试、刷新重发，
+// 都返回首次成功结果且只执行一次。仅成功才存证（失败重试得到相同错误）；
+// 存证深拷贝，后续变更不会污染已存证的响应；记录随状态持久化，跨重启有效。
+export function withIdempotency(state, now, idemKey, fn) {
+  if (idemKey && state.idempotency[idemKey]) {
+    return { ...state.idempotency[idemKey].body, _replay: true };
+  }
+  const body = fn();
+  if (idemKey) {
+    state.idempotency[idemKey] = { body: JSON.parse(JSON.stringify(body)), createdAt: iso(now) };
+    gcIdempotency(state, now);
+  }
+  return body;
 }

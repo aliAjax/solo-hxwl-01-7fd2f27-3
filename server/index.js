@@ -41,6 +41,8 @@ export function createApp({ dataFile, nowFn = () => new Date(), sweepIntervalMs 
     const actor = actorOf(req);
     const now = nowFn();
     const q = url.searchParams;
+    // 幂等变更：携带 Idempotency-Key 的请求，并发/双击/失败重试/刷新重发都返回首次结果，绝不重复执行
+    const mutate = (fn) => store.transact((s) => dom.withIdempotency(s, now, req.headers['idempotency-key'] || null, () => fn(s)));
 
     // ---- 只读 ----
     if (m === 'GET' && p === '/api/health') return { ok: true, now: dom.iso(now) };
@@ -106,44 +108,39 @@ export function createApp({ dataFile, nowFn = () => new Date(), sweepIntervalMs 
       return store.read((s) => dom.handoverSummary(s, now));
     }
 
-    // ---- 变更（全部串行事务）----
+    // ---- 变更（全部串行事务 + 幂等包装）----
     if (m === 'POST' && p === '/api/instruments') {
-      return store.transact((s) => dom.createInstrument(s, now, { actor, ...body }));
+      return mutate((s) => dom.createInstrument(s, now, { actor, ...body }));
     }
     if (m === 'POST' && p === '/api/batches') {
-      return store.transact((s) => dom.createBatch(s, now, { actor, ...body }));
+      return mutate((s) => dom.createBatch(s, now, { actor, ...body }));
     }
     const equipMatch = p.match(/^\/api\/equipment\/([^/]+)$/);
     if (m === 'PATCH' && equipMatch) {
-      return store.transact((s) => dom.updateEquipment(s, now, { actor, equipmentId: equipMatch[1], ...body }));
+      return mutate((s) => dom.updateEquipment(s, now, { actor, equipmentId: equipMatch[1], ...body }));
     }
     const act = p.match(/^\/api\/batches\/([^/]+)\/(complete|monitor|release|lock|rechecks)$/);
     if (m === 'POST' && act) {
       const [, batchId, action] = act;
-      if (action === 'complete') return store.transact((s) => dom.completeBatch(s, now, { actor, batchId, ...body }));
-      if (action === 'monitor') return store.transact((s) => dom.recordMonitor(s, now, { actor, batchId, ...body }));
-      if (action === 'lock') return store.transact((s) => dom.lockBatch(s, now, { actor, batchId, ...body }));
-      if (action === 'rechecks') return store.transact((s) => dom.recheckBatch(s, now, { actor, batchId, ...body }));
-      if (action === 'release') {
-        const idemKey = req.headers['idempotency-key'] || null;
-        const result = await store.transact((s) => dom.releaseBatch(s, now, { actor, batchId, idemKey, ...body }));
-        if (result._replay) res.setHeader('Idempotent-Replay', 'true');
-        return result;
-      }
+      if (action === 'complete') return mutate((s) => dom.completeBatch(s, now, { actor, batchId, ...body }));
+      if (action === 'monitor') return mutate((s) => dom.recordMonitor(s, now, { actor, batchId, ...body }));
+      if (action === 'lock') return mutate((s) => dom.lockBatch(s, now, { actor, batchId, ...body }));
+      if (action === 'rechecks') return mutate((s) => dom.recheckBatch(s, now, { actor, batchId, ...body }));
+      if (action === 'release') return mutate((s) => dom.releaseBatch(s, now, { actor, batchId, ...body }));
     }
     const instAct = p.match(/^\/api\/instruments\/([^/]+)\/(checkout|return|pause-related)$/);
     if (m === 'POST' && instAct) {
       const [, instrumentId, action] = instAct;
-      if (action === 'checkout') return store.transact((s) => dom.checkoutInstrument(s, now, { actor, instrumentId, ...body }));
-      if (action === 'return') return store.transact((s) => dom.returnInstrument(s, now, { actor, instrumentId, ...body }));
-      if (action === 'pause-related') return store.transact((s) => dom.pauseRelated(s, now, { actor, rootInstrumentId: instrumentId, ...body }));
+      if (action === 'checkout') return mutate((s) => dom.checkoutInstrument(s, now, { actor, instrumentId, ...body }));
+      if (action === 'return') return mutate((s) => dom.returnInstrument(s, now, { actor, instrumentId, ...body }));
+      if (action === 'pause-related') return mutate((s) => dom.pauseRelated(s, now, { actor, rootInstrumentId: instrumentId, ...body }));
     }
     const liftMatch = p.match(/^\/api\/pauses\/([^/]+)\/lift$/);
     if (m === 'POST' && liftMatch) {
-      return store.transact((s) => dom.liftPause(s, now, { actor, pauseId: liftMatch[1], ...body }));
+      return mutate((s) => dom.liftPause(s, now, { actor, pauseId: liftMatch[1], ...body }));
     }
     if (m === 'POST' && p === '/api/handover') {
-      return store.transact((s) => dom.recordHandover(s, now, { actor, ...body }));
+      return mutate((s) => dom.recordHandover(s, now, { actor, ...body }));
     }
     throw new dom.DomainError(404, 'NO_ROUTE', `接口不存在：${m} ${p}`);
   }
@@ -179,6 +176,7 @@ export function createApp({ dataFile, nowFn = () => new Date(), sweepIntervalMs 
     try {
       if (url.pathname.startsWith('/api/')) {
         const data = await handleApi(req, res, url);
+        if (data && data._replay === true) res.setHeader('Idempotent-Replay', 'true');
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify(data));
         return;

@@ -49,7 +49,7 @@ const STATUS_STYLE: Record<string, string> = {
   '已放行': 'green', '已锁定': 'red', '部分恢复': 'amber', '已恢复': 'green',
   '正常': 'green', '校准过期': 'red', '停用': 'gray',
   '合格': 'green', '不合格': 'red', '未做': 'gray',
-  '已归还': 'gray', 'active': 'red', 'partial': 'amber', 'lifted': 'green',
+  '已归还': 'gray', '已召回': 'red', 'active': 'red', 'partial': 'amber', 'lifted': 'green',
   '严重': 'red', '警告': 'amber', '提示': 'blue',
 };
 export function Pill({ text }: { text: string }) {

@@ -113,15 +113,15 @@ export function Batches({ focusId, onFocusConsumed }: { focusId?: string | null;
       )}
       {lockFor && (
         <LockModal batch={lockFor} onClose={() => setLockFor(null)}
-          onLock={(reason) => act(async () => {
-            await api('POST', `/api/batches/${lockFor.id}/lock`, { reason, expectedVersion: lockFor.version });
+          onLock={(reason, idemKey) => act(async () => {
+            await api('POST', `/api/batches/${lockFor.id}/lock`, { reason, expectedVersion: lockFor.version }, { idemKey });
             setLockFor(null);
           }, '批次已锁定，同批器械已隔离')} />
       )}
       {recheckFor && (
         <RecheckModal batch={recheckFor} instruments={instruments} onClose={() => setRecheckFor(null)}
-          onRecheck={(payload) => act(async () => {
-            await api('POST', `/api/batches/${recheckFor.id}/rechecks`, { ...payload, expectedVersion: recheckFor.version });
+          onRecheck={(payload, idemKey) => act(async () => {
+            await api('POST', `/api/batches/${recheckFor.id}/rechecks`, { ...payload, expectedVersion: recheckFor.version }, { idemKey });
             setRecheckFor(null);
           }, '复检结果已登记')} />
       )}
@@ -337,17 +337,18 @@ function ReleaseModal({ batch, equipment, onClose, onDone }: {
   );
 }
 
-function LockModal({ batch, onClose, onLock }: { batch: Batch; onClose: () => void; onLock: (reason: string) => void }) {
+function LockModal({ batch, onClose, onLock }: { batch: Batch; onClose: () => void; onLock: (reason: string, idemKey: string) => void }) {
   const [reason, setReason] = useState('');
+  const [idemKey] = useState(newIdemKey);
   return (
     <Modal title={`锁定批次 ${batch.batchNo}`} onClose={onClose}>
-      <div className="banner warn">锁定后同批 {batch.items.length} 件器械将自动隔离，使用中的会被标记召回</div>
+      <div className="banner warn">锁定后同批 {batch.items.length} 件器械将自动隔离（含曾恢复的器械，将重新隔离），使用中的会被标记召回</div>
       <Field label="锁定原因" hint="例如：生物监测不合格 / 设备故障 / 疑似污染">
         <textarea rows={3} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="必填" />
       </Field>
       <div className="modal-foot">
         <button className="btn" onClick={onClose}>取消</button>
-        <button className="btn danger" disabled={!reason.trim()} onClick={() => onLock(reason.trim())}>确认锁定并隔离</button>
+        <button className="btn danger" disabled={!reason.trim()} onClick={() => onLock(reason.trim(), idemKey)}>确认锁定并隔离</button>
       </div>
     </Modal>
   );
@@ -355,12 +356,13 @@ function LockModal({ batch, onClose, onLock }: { batch: Batch; onClose: () => vo
 
 function RecheckModal({ batch, instruments, onClose, onRecheck }: {
   batch: Batch; instruments: Instrument[]; onClose: () => void;
-  onRecheck: (p: { result: string; scopeInstrumentIds: string[]; note: string }) => void;
+  onRecheck: (p: { result: string; scopeInstrumentIds: string[]; note: string }, idemKey: string) => void;
 }) {
   const open = batch.quarantine.filter((q) => !q.restoredAt);
   const [result, setResult] = useState('合格');
   const [scope, setScope] = useState<Set<string>>(new Set(open.map((q) => q.instrumentId)));
   const [note, setNote] = useState('');
+  const [idemKey] = useState(newIdemKey); // 弹窗期间固定：双击/重试不重复提交
   const nameOf = (id: string) => {
     const i = instruments.find((x) => x.id === id);
     return i ? `${i.code} ${i.name}` : id;
@@ -388,7 +390,7 @@ function RecheckModal({ batch, instruments, onClose, onRecheck }: {
       <div className="modal-foot">
         <button className="btn" onClick={onClose}>取消</button>
         <button className="btn primary" disabled={scope.size === 0}
-          onClick={() => onRecheck({ result, scopeInstrumentIds: [...scope], note })}>提交复检</button>
+          onClick={() => onRecheck({ result, scopeInstrumentIds: [...scope], note }, idemKey)}>提交复检</button>
       </div>
     </Modal>
   );
