@@ -1,159 +1,97 @@
-import "./styles.css";
+import React, { useCallback, useEffect, useState } from 'react';
+import { api, getActor, setActor, AlertItem } from './api';
+import { ToastProvider } from './ui';
+import { Dashboard, DashboardState } from './pages/Dashboard';
+import { Batches } from './pages/Batches';
+import { Instruments } from './pages/Instruments';
+import { EquipmentPage } from './pages/Equipment';
+import { UsagePage } from './pages/Usage';
+import { Handover } from './pages/Handover';
+import './styles.css';
 
-const project = {
-  "id": "hxwl-01",
-  "port": 5101,
-  "title": "听力验配记录",
-  "subtitle": "门店听力师的验配档案与听力曲线工作台",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#155e75",
-    "#22c55e",
-    "#f97316"
-  ],
-  "domain": "听力验配",
-  "users": [
-    "听力师",
-    "门店主管",
-    "复诊助理"
-  ],
-  "metrics": [
-    "左耳PTA",
-    "右耳PTA",
-    "言语识别率",
-    "复诊天数"
-  ],
-  "filters": [
-    "初配",
-    "复调",
-    "儿童",
-    "老人"
-  ],
-  "fields": [
-    "气导",
-    "骨导",
-    "言语识别率",
-    "助听器型号",
-    "增益调整",
-    "用户反馈"
-  ],
-  "records": [
-    [
-      "Liu-024",
-      "双耳高频下降",
-      "初配",
-      "RIC机型，2kHz后增益提高4dB"
-    ],
-    [
-      "Chen-118",
-      "单侧传导性损失",
-      "复调",
-      "低频压缩略降，反馈啸叫已消失"
-    ],
-    [
-      "Zhao-077",
-      "老人语频区下降",
-      "复诊",
-      "言语识别率从64%提升到76%"
-    ]
-  ]
-};
+type Tab = 'dashboard' | 'batches' | 'instruments' | 'equipment' | 'usage' | 'handover';
+const TABS: [Tab, string][] = [
+  ['dashboard', '总览'],
+  ['batches', '消毒批次'],
+  ['instruments', '器械追溯'],
+  ['equipment', '设备校准'],
+  ['usage', '领用登记'],
+  ['handover', '交接班'],
+];
+const OPERATORS = ['王芳', '李强', '赵敏'];
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
+function Shell() {
+  const [tab, setTab] = useState<Tab>('dashboard');
+  const [actor, setActorState] = useState(getActor());
+  const [state, setState] = useState<DashboardState | null>(null);
+  const [focus, setFocus] = useState<{ type: 'batch' | 'instrument'; id: string } | null>(null);
 
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
-}
+  const refreshState = useCallback(async () => {
+    try { setState(await api<DashboardState>('GET', '/api/state')); } catch { /* 后端未就绪时静默重试 */ }
+  }, []);
+  useEffect(() => {
+    refreshState();
+    const t = setInterval(refreshState, 15000);
+    return () => clearInterval(t);
+  }, [refreshState]);
 
-function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const severe = state?.alerts.filter((a) => a.tier === '严重').length ?? 0;
+
+  const jumpTo = (entityType: string, entityId: string) => {
+    if (entityType === 'batch') { setFocus({ type: 'batch', id: entityId }); setTab('batches'); }
+    else if (entityType === 'instrument') { setFocus({ type: 'instrument', id: entityId }); setTab('instruments'); }
+    else if (entityType === 'equipment') { setTab('equipment'); }
+    else setTab('dashboard');
+  };
 
   return (
-    <main className="app-shell">
-      <section className="hero">
-        <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
-        </div>
-        <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
-        </div>
-      </section>
-
-      <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
-      </section>
-
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
-
-      <section className="records panel">
-        <div className="section-heading">
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark">⌖</span>
           <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
+            <div className="brand-title">听力门诊 · 器械消毒与校准追踪台</div>
+            <div className="brand-sub">消毒供应追溯 / 校准效期 / 生物监测 / 交接班</div>
           </div>
-          <button>导出摘要</button>
         </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
+        <nav className="tabs">
+          {TABS.map(([key, label]) => (
+            <button key={key} className={`tab ${tab === key ? 'on' : ''}`} onClick={() => setTab(key)}>
+              {label}
+              {key === 'dashboard' && severe > 0 && <span className="badge">{severe}</span>}
+            </button>
           ))}
+        </nav>
+        <div className="actor">
+          <span className="dim small">当前操作员</span>
+          <select value={actor} onChange={(e) => { setActor(e.target.value); setActorState(e.target.value); }}>
+            {OPERATORS.map((o) => <option key={o}>{o}</option>)}
+          </select>
         </div>
-      </section>
-    </main>
+      </header>
+
+      <main>
+        {tab === 'dashboard' && (state
+          ? <Dashboard state={state} onJump={(a: AlertItem) => jumpTo(a.entityType, a.entityId)} />
+          : <div className="page"><div className="empty">正在连接服务…</div></div>)}
+        {tab === 'batches' && (
+          <Batches focusId={focus?.type === 'batch' ? focus.id : null} onFocusConsumed={() => setFocus(null)} />
+        )}
+        {tab === 'instruments' && (
+          <Instruments focusId={focus?.type === 'instrument' ? focus.id : null} onFocusConsumed={() => setFocus(null)} />
+        )}
+        {tab === 'equipment' && <EquipmentPage />}
+        {tab === 'usage' && <UsagePage />}
+        {tab === 'handover' && <Handover onJump={jumpTo} />}
+      </main>
+    </div>
   );
 }
 
-export default App;
+export default function App() {
+  return (
+    <ToastProvider>
+      <Shell />
+    </ToastProvider>
+  );
+}
